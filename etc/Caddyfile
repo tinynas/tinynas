@@ -1,0 +1,101 @@
+{
+    servers :443 {
+        timeouts {
+            idle 600s
+            read_body 600s
+            read_header 600s
+            write 600s
+        }
+        max_header_size 100MB
+    }
+    servers {
+        timeouts {
+            idle 600s
+            read_body 600s
+            read_header 600s
+            write 600s
+        }
+        max_header_size 20MB
+    }
+}
+
+nextcloud.{$HOST} {
+    log {
+        level INFO
+        output file {$LOG_FILE} {
+            roll_size 10MB
+            roll_keep 10
+        }
+    }
+
+    tls {$EMAIL}
+
+    encode gzip
+    
+    header {
+        # enable HSTS
+        # Strict-Transport-Security max-age=31536000;
+    }
+
+    file_server
+    root * /var/www/nextcloud
+
+    @forbidden {
+        path /.htaccess
+        path /data/*
+        path /config/*
+        path /db_structure
+        path /.xml
+        path /README
+        path /3rdparty/*
+        path /lib/*
+        path /templates/*
+        path /occ
+        path /console.php
+    }
+    respond @forbidden 404
+    php_fastcgi nextcloud:9000 {
+        root /var/www/html
+        env front_controller_active true
+        dial_timeout 600s
+        read_timeout 600s
+        write_timeout 600s
+    }
+}
+
+vaultwarden.{$HOST} {
+    log {
+        level INFO
+        output file {$LOG_FILE} {
+            roll_size 10MB
+            roll_keep 10
+        }
+    }
+
+    tls {$EMAIL}
+
+    encode gzip
+
+    reverse_proxy /notifications/hub vaultwarden:3012
+    reverse_proxy vaultwarden:80 {
+        header_up X-Real-IP {remote_host}
+    }
+}
+
+transmission.{$HOST} {
+    log {
+        level INFO
+        output file {$LOG_FILE} {
+            roll_size 10MB
+            roll_keep 10
+        }
+    }
+
+    tls {$EMAIL}
+
+    encode gzip
+
+    reverse_proxy transmission:9091 {
+        header_up X-Real-IP {remote_host}
+    }
+}

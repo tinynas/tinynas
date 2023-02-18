@@ -1,0 +1,238 @@
+version: "3.0"
+
+volumes:
+  media:
+  transmission-config:
+  transmission-watch:
+  nextcloud-config:
+  nextcloud-data:
+  nextcloud-www:
+  caddy-config:
+  caddy-data:
+  vw-data:
+  postgres-data:
+  postgres-backups:
+
+networks:
+  inner:
+
+services:
+  minidlna:
+    build:
+      context: minidlna
+      dockerfile: Dockerfile
+    container_name: dlna
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ}
+      MINIDLNA_MEDIA_DIR: /media
+      MINIDLNA_FRIENDLY_NAME: tinyNAS
+    volumes:
+      - media:/media
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--silent",
+          "--fail",
+          "127.0.0.1:8200",
+          "||",
+          "exit 1"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    ports:
+      - 8200:8200
+  
+  transmission:
+    image: lscr.io/linuxserver/transmission:latest
+    container_name: transmission
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+      - USER=${TRANSMISSION_USER}
+      - PASS=${TRANSMISSION_PASSWORD}
+    volumes:
+      - transmission-config:/config
+      - media:/downloads
+      - transmission-watch:/watch
+    ports:
+      - 51413:51413
+      - 51413:51413/udp
+    restart: unless-stopped
+    networks:
+      - inner
+
+  nextcloud:
+    image: nextcloud:stable-fpm-alpine
+    container_name: nextcloud
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ}
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_HOST: postgres:5432
+      NEXTCLOUD_TRUSTED_DOMAINS: nextcloud.${HOST}
+      REDIS_HOST: redis
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - nextcloud-config:/config:rw
+      - nextcloud-data:/var/data:rw
+      - nextcloud-www:/var/www/html:rw
+    restart: unless-stopped
+    networks:
+      - inner
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  nextcloud-cron:
+    image: nextcloud:stable-fpm-alpine
+    restart: always
+    container_name: nextcloud-cron
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ}
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_HOST: postgres:5432
+      NEXTCLOUD_TRUSTED_DOMAINS: nextcloud.${HOST}
+      REDIS_HOST: redis
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - nextcloud-config:/config:rw
+      - nextcloud-data:/data:rw
+      - nextcloud-www:/var/www/html:rw
+    entrypoint: /cron.sh
+    networks:
+      - inner
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: always
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ}
+      WEBSOCKET_ENABLED: "true"
+      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/vaultwarden
+    volumes:
+      - vw-data:/data
+    networks:
+      - inner
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gateway:
+    image: caddy:2
+    container_name: caddy
+    restart: always
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - ./etc/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-config:/config:rw
+      - caddy-data:/data:rw
+      - nextcloud-www:/var/www/nextcloud:rw
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ}
+      HOST: ${HOST}
+      EMAIL: ${EMAIL}
+      LOG_FILE: "/data/access.log"
+    networks:
+      - inner
+    depends_on:
+      - nextcloud
+      - vaultwarden
+      - transmission
+
+  postgres:
+    image: postgres:15.2-alpine3.17
+    restart: always
+    container_name: postgres
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ}
+      PGUSER: ${PG_USER}
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      DB_NAME: nextcloud,vaultwarden
+      LANG: ru_RU.utf8
+    volumes:
+      - "postgres-data:/var/lib/postgresql/data"
+      - "./etc/init.sql:/docker-entrypoint-initdb.d/init.sql"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d vaultwarden -U docker"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    networks:
+      - inner
+
+  backups:
+    image: postgres:15.2-alpine3.17
+    container_name: postgres_backup
+    # Run nextcloud-restore-application-data.sh to restore application data if needed.
+    # Run nextcloud-restore-database.sh to restore database if needed.
+    command: sh -c 'sleep 30m
+             && while true; do
+             PGPASSWORD="$$(echo $$POSTGRES_PASSWORD)"
+             pg_dump
+             -h postgres
+             -p 5432
+             -d nextcloud
+             -U docker | gzip > /srv/nextcloud-postgres/backups/nextcloud-postgres-backup-$$(date "+%Y-%m-%d_%H-%M").gz
+             && tar -zcpf /srv/nextcloud-application-data/backups/nextcloud-application-data-backup-$$(date "+%Y-%m-%d_%H-%M").tar.gz /var/www/html
+             && find /srv/nextcloud-postgres/backups -type f -mtime +7 | xargs rm -f
+             && find /srv/nextcloud-application-data/backups -type f -mtime +7 | xargs rm -f;
+             sleep 24h; done'
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ}
+      PGUSER: ${PG_USER}
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      DB_NAME: nextcloud,vaultwarden
+      LANG: ru_RU.utf8
+    volumes:
+      - "postgres-data:/var/lib/postgresql/data"
+      # Database backups location
+      - "postgres-backups:/srv/nextcloud-postgres/backups"
+    restart: unless-stopped
+    depends_on:
+      postgres: 
+        condition: service_healthy
+
+  redis:
+    container_name: redis
+    image: redis:alpine3.17
+    restart: always
+    mem_limit: 2048m
+    mem_reservation: 512m
+    command: redis-server --requirepass $REDIS_PASSWORD
+    networks:
+      - inner
